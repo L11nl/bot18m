@@ -79,14 +79,20 @@ def get_provider_url(provider_name):
     return UOTP_API_URL if provider_name == "uotp" else GRIZZLY_API_URL
 
 async def get_sms_number(api_key, provider):
-    """شراء الرقم (هندي حصراً country=22) مع التدرج الذكي بالسعر لموقع UOTP"""
+    """شراء الرقم باستهداف ذكي للسيرفرات (الأرخص أولاً) لموقع UOTP"""
     urls = []
     
     if provider == "uotp":
-        # يبدأ من الأرخص (13) ويصعد للـ 16 إذا ماكو أرقام
-        for price in [13, 14, 15, 16]:
-            urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service=myjio&country=22&maxPrice={price}")
-            urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service=jio&country=22&maxPrice={price}")
+        # ترتيب السيرفرات: 12 (13₹) -> 11 (15₹) -> بدون تحديد كفرصة أخيرة
+        operators = ["12", "11", "any"]
+        services = ["myjio", "jio"]
+        
+        for op in operators:
+            for srv in services:
+                if op == "any":
+                    urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service={srv}&country=22")
+                else:
+                    urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service={srv}&country=22&operator={op}")
     else:
         urls = [f"{GRIZZLY_API_URL}?api_key={api_key}&action=getNumber&service=jio&country=22"]
         
@@ -100,11 +106,11 @@ async def get_sms_number(api_key, provider):
                 return parts[1], parts[2], ""
             else:
                 last_err = text
-                # إذا ماكو أرقام بهذا السعر، كمل للرابط اللي بعده (السعر الأغلى)
+                # إذا السيرفر مابيه أرقام أو المشغل خطأ، جرب الرابط والسيرفر اللي بعده فوراً
                 if text in ["NO_NUMBERS", "BAD_SERVICE", "BAD_OPERATOR"]:
                     continue
                 else:
-                    break # أخطاء مثل NO_BALANCE توقف المحاولات فوراً
+                    break # توقف المحاولات فوراً للأخطاء القاتلة (مثل NO_BALANCE)
         except Exception as e:
             last_err = "خطأ اتصال بالموقع"
             break
@@ -122,7 +128,6 @@ async def check_sms_otp(api_key, tzid, provider):
     return None
 
 async def robust_cancel(api_key, tzid, provider, context=None, user_id=None, check_for_otp=False):
-    """إلغاء الأرقام بعد انتظار الدقيقتين لكلا المزودين، مع اقتناص الأكواد المتأخرة"""
     for _ in range(30):
         if check_for_otp and context and user_id:
             otp = await check_sms_otp(api_key, tzid, provider)
