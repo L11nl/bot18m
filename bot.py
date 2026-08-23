@@ -62,10 +62,11 @@ class UserSession:
         self.message_obj = None
         self.last_buy_time = time.time()
         self.alert_sent = False 
-        self.target_limit = 0  # 0 يعني لا محدود
+        self.target_limit = 0  
         self.max_workers = 20
-        self.recurring_mode = 0 # حجم الدفعة المتكررة
+        self.recurring_mode = 0 
         self.limit_lock = None  
+        self.tasks_reserved = 0 
 
 active_sessions = {}
 
@@ -77,7 +78,6 @@ async def async_human_delay(min_sec=2.0, max_sec=4.5):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
 
 def add_custom_emojis(text: str) -> str:
-    """استبدال أسماء الدول بإيموجيات مخصصة"""
     replacements = {
         r"(الكويت|دينار كويتي)": r"\1 <tg-emoji emoji-id='5221949726718442491'>🇰🇼</tg-emoji>",
         r"(السعودية|ريال سعودي)": r"\1 <tg-emoji emoji-id='5224698145010624573'>🇸🇦</tg-emoji>",
@@ -176,66 +176,99 @@ async def check_grizzly_otp(api_key, tzid):
     return None
 
 async def robust_cancel(api_key, tzid, context=None, user_id=None, check_for_otp=False):
-    """دالة الإلغاء الذكية: تنتظر فترة الدقيقتين وتتحقق من الأكواد أثناء الانتظار"""
-    for _ in range(30): # المحاولة لمدة تصل لـ 150 ثانية
+    """دالة الإلغاء الذكية: تنتظر دقيقتين بالخلفية وتتحقق من الأكواد أثناء الانتظار"""
+    for _ in range(30): # المحاولة لمدة 150 ثانية
         if check_for_otp and context and user_id:
             otp = await check_grizzly_otp(api_key, tzid)
             if otp:
                 try:
-                    msg = add_custom_emojis(f"📩 <b>كود متأخر!</b> وصل كود أثناء محاولة الإلغاء:\nالرقم ID: <code>{tzid}</code>\nالكود: <code>{otp}</code>")
+                    msg = add_custom_emojis(f"📩 <b>كود متأخر!</b> وصل كود أثناء محاولة الإلغاء للرقم اللي كان معلگ:\nالرقم ID: <code>{tzid}</code>\nالكود: <code>{otp}</code>")
                     await context.bot.send_message(chat_id=int(user_id), text=msg, parse_mode='HTML')
                 except: pass
-                return True # وصل كود، نعوف الإلغاء
+                return True # إذا وصل كود، نعوف الإلغاء
         
         url = f"{GRIZZLY_API_URL}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
         try:
             resp = await asyncio.to_thread(requests.get, url, timeout=10)
-            text = resp.text.strip()
-            if "ACCESS_CANCEL" in text:
+            if "ACCESS_CANCEL" in resp.text:
                 return True
-            # إذا الموقع رد EARLY_CANCEL_DENIED يعني ما مرن دقيقتين، فراح يسوي sleep ويرجع يحاول
         except: pass
         await asyncio.sleep(5)
     return False
 
+async def cancel_active_grizzly_numbers(api_key):
+    """إلغاء سريع للأرقام القديمة اللي عبرت عليها الدقيقتين (يشتغل ببداية التشغيل)"""
+    url = f"{GRIZZLY_API_URL}?api_key={api_key}&action=getActiveActivations"
+    count = 0
+    try:
+        resp = await asyncio.to_thread(requests.get, url, timeout=15)
+        text_resp = resp.text.strip()
+        if text_resp == "NO_ACTIVATIONS": return 0
+        
+        data = resp.json()
+        if data.get("status") == "success":
+            for item in data.get("activeActivations", []):
+                tzid = item.get("activationId")
+                if tzid:
+                    url_cancel = f"{GRIZZLY_API_URL}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
+                    resp_cancel = await asyncio.to_thread(requests.get, url_cancel, timeout=10)
+                    if "ACCESS_CANCEL" in resp_cancel.text:
+                        count += 1
+    except: pass
+    return count
+
 async def smart_cancel_all_task(api_key, context, user_id, msg_obj):
-    """دالة إلغاء جميع الأرقام المعلقة بذكاء وبدون تجميد البوت"""
+    """دالة زر (إلغاء الأرقام المعلقة) بذكاء وبدون تجميد البوت مع تصليح خطأ NO_ACTIVATIONS"""
     url = f"{GRIZZLY_API_URL}?api_key={api_key}&action=getActiveActivations"
     try:
         resp = await asyncio.to_thread(requests.get, url, timeout=15)
-        data = resp.json()
+        text_resp = resp.text.strip()
+        
+        if text_resp == "NO_ACTIVATIONS":
+            await msg_obj.edit_text("✅ <b>لا توجد أرقام معلقة حالياً بحسابك.</b>", parse_mode='HTML')
+            return
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            await msg_obj.edit_text(f"❌ استجابة غير متوقعة: <code>{text_resp}</code>", parse_mode='HTML')
+            return
+
         if data.get("status") == "success":
             activations = data.get("activeActivations", [])
             if not activations:
                 await msg_obj.edit_text("✅ <b>لا توجد أرقام معلقة حالياً بحسابك.</b>", parse_mode='HTML')
                 return
             
-            await msg_obj.edit_text(f"🗑 <b>تم العثور على {len(activations)} أرقام جارية.</b>\n⏳ جاري مراقبتها وإلغائها بمجرد انتهاء فترة الدقيقتين (مع إرسال أي كود يصل أثناء الانتظار)...", parse_mode='HTML')
+            await msg_obj.edit_text(f"🗑 <b>تم العثور على {len(activations)} أرقام جارية.</b>\n⏳ جاري مراقبتها بالخلفية وإلغائها بمجرد انتهاء فترة الدقيقتين (مع إرسال أي كود يصل أثناء الانتظار)...", parse_mode='HTML')
             
-            # نشغل الإلغاء بالخلفية لكل رقم حتى ميجمد البوت
             for item in activations:
                 tzid = item.get("activationId")
                 if tzid:
+                    # نشغل الإلغاء بالخلفية بدون ما نوقف البوت
                     asyncio.create_task(robust_cancel(api_key, tzid, context, user_id, check_for_otp=True))
-    except Exception:
-        await msg_obj.edit_text("❌ حدث خطأ أثناء الاتصال بالموقع لجلب الأرقام.", parse_mode='HTML')
+        else:
+            await msg_obj.edit_text("❌ لم ينجح الموقع في جلب قائمة الأرقام.", parse_mode='HTML')
+            
+    except Exception as e:
+        logger.error(f"Error fetching activations: {e}")
+        await msg_obj.edit_text("❌ حدث خطأ أثناء الاتصال بالموقع لجلب الأرقام. تأكد من صحة مفتاح الـ API.", parse_mode='HTML')
 
 # ============ المنظومة الذاتية للمستخدم ============
-
 async def recurring_manager(user_id, context: ContextTypes.DEFAULT_TYPE):
-    """مهمة تعمل بالخلفية لزيادة عدد المشتريات المطلوبة كل دقيقتين للوضع المجدول"""
+    """مهمة الجدولة: تضيف العدد المطلوب كل دقيقتين"""
     s = active_sessions.get(user_id)
     if not s: return
     batch = s.recurring_mode
     while s.status in ["running", "stopping"]:
-        await asyncio.sleep(120) # انتظار دقيقتين
+        await asyncio.sleep(120) 
         if s.status == "running":
             async with s.limit_lock:
                 s.target_limit += batch
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id), 
-                    text=f"🔄 <b>تحديث الجدولة:</b> تمت إضافة {batch} أرقام جديدة ليتم شراؤها الآن. الهدف الإجمالي أصبح: <code>{s.target_limit}</code>", 
+                    text=f"🔄 <b>تحديث الجدولة:</b> تمت إضافة {batch} للهدف. الهدف أصبح: <code>{s.target_limit}</code>", 
                     parse_mode='HTML'
                 )
             except: pass
@@ -246,37 +279,37 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     
     while session_data.status == "running":
         
-        # التأكد من عدم تجاوز العدد المسموح للأرقام المشتراة
+        # 1. التحقق من اكتمال الهدف وإيقاف النظام إذا تحقق
         async with session_data.limit_lock:
-            if session_data.target_limit > 0 and session_data.bought >= session_data.target_limit:
+            if session_data.target_limit > 0 and session_data.success_links >= session_data.target_limit:
                 if session_data.recurring_mode == 0:
-                    session_data.status = "stopping" # انتهى الهدف، ابدأ بالتصفية
+                    session_data.status = "stopping"
                     break
-                    
-        if session_data.target_limit > 0 and session_data.bought >= session_data.target_limit:
-            await asyncio.sleep(2)
-            continue
 
-        if session_data.active_workers >= session_data.max_workers:
-            await asyncio.sleep(2)
-            continue
-
-        # تسجيل شراء رقم (حجز مكان)
+        # 2. نظام حجز المقاعد الذكي (لا نشتري أرقام عشوائية بل نعوض النقص فقط)
+        reserved_in_this_loop = False
         async with session_data.limit_lock:
-            if session_data.target_limit > 0 and session_data.bought >= session_data.target_limit:
-                continue
-            session_data.bought += 1
-            session_data.active_workers += 1
+            current_total = session_data.success_links + session_data.tasks_reserved
+            if session_data.target_limit > 0 and current_total >= session_data.target_limit:
+                pass # الهدف ممتلئ، ننتظر
+            elif session_data.active_workers >= session_data.max_workers:
+                pass # العمال مشغولين
+            else:
+                session_data.tasks_reserved += 1
+                session_data.active_workers += 1
+                reserved_in_this_loop = True
+                
+        if not reserved_in_this_loop:
+            await asyncio.sleep(2)
+            continue
 
         try:
             tzid, number = await get_grizzly_number(api_key)
             if not tzid:
-                # إذا الرصيد خلص أو الموقع مابي أرقام، نرجع العداد حتى يحاول مرة ثانية
-                async with session_data.limit_lock:
-                    session_data.bought -= 1
                 await asyncio.sleep(3)
-                continue
+                continue # سيتكفل finally بطرح المقعد ليعاد المحاولة
 
+            session_data.bought += 1
             session_data.last_buy_time = time.time()
             session_data.alert_sent = False 
             
@@ -286,7 +319,7 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
             await async_human_delay(1.0, 2.5) 
             is_valid = await asyncio.to_thread(check_jio_number, session, mobile)
             if not is_valid:
-                # إلغاء بالخلفية حتى العامل يكمل شغله بسرعة
+                # الرقم مرفوض من Jio! نلغيه بالخلفية ونجبر الـ finally تعوضنا برقم جديد
                 asyncio.create_task(robust_cancel(api_key, tzid, context, user_id, check_for_otp=False))
                 session_data.invalid_jio += 1
                 continue
@@ -301,10 +334,9 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
             start_time = time.time()
             otp_received = None
             
-            # انتظار الكود (حتى لو ضغطنا توقف، راح يبقى ينتظر بأمان)
             while time.time() - start_time < 130:
                 if session_data.status == "stopped": 
-                    break # توقف إجباري تام
+                    break 
                 otp = await check_grizzly_otp(api_key, tzid)
                 if otp:
                     otp_received = otp.strip() 
@@ -312,7 +344,7 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
                 await asyncio.sleep(5)
                 
             if not otp_received:
-                # خلص الوقت وماكو كود.. نرسله للإلغاء الذكي مع مراقبة الأكواد المتأخرة
+                # لم يصل كود خلال دقيقتين، نتركه للإلغاء الذكي ونحرر المقعد
                 asyncio.create_task(robust_cancel(api_key, tzid, context, user_id, check_for_otp=True))
                 session_data.cancelled_timeout += 1
                 continue
@@ -326,8 +358,11 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
                 status, url = await asyncio.to_thread(extract_activation, session)
                 if status == "success":
                     with open(f"gemini_links_{user_id}.txt", "a") as f: f.write(url + "\n")
-                    session_data.success_links += 1
                     
+                    # نزيد الروابط الناجحة
+                    async with session_data.limit_lock:
+                        session_data.success_links += 1
+                        
                     text_msg = f"🎉 <b>تم صيد رابط جديد!</b>\n\n📱 الرقم: <code>{mobile}</code>\n🔗 الرابط:\n{url}"
                     text_msg = add_custom_emojis(text_msg)
                     try:
@@ -336,9 +371,14 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
                         logger.error(f"خطأ في إرسال الرابط: {e}")
                 else: session_data.otp_rejected_jio += 1
             else: session_data.otp_rejected_jio += 1
+            
         finally:
-            session_data.active_workers -= 1
-            # ملاحظة: إذا اشترى الرقم، فهو انحسب ضمن العدد المطلوب، حتى لا يظل يشتري بلا نهاية.
+            if reserved_in_this_loop:
+                async with session_data.limit_lock:
+                    session_data.active_workers -= 1
+                    session_data.tasks_reserved -= 1
+                    # ملاحظة: إذا نجح الرقم، زادت الروابط الناجحة وتم إخلاء المقعد، فالمجموع الكلي يظل ثابت ولن يشتري رقماً زائداً.
+                    # وإذا فشل الرقم، لم تزد الروابط الناجحة، فسيتم إخلاء المقعد وشراء رقم جديد مكانه تلقائياً!
 
 def get_dashboard_text(user_id):
     s = active_sessions[user_id]
@@ -352,9 +392,9 @@ def get_dashboard_text(user_id):
     raw_text = (
         f"📊 <b>إحصائيات الحساب المباشرة:</b>\n\n"
         f"الحالة: {status_emoji} {status_text}\n"
-        f"🎯 <b>الهدف (أرقام):</b> <code>{target_str}</code>\n"
-        f"⚙️ <b>الخطوط النشطة الآن:</b> <code>{s.active_workers} / {s.max_workers}</code>\n"
-        f"🛒 <b>تم شراء (أرقام فعلية):</b> <code>{s.bought}</code>\n"
+        f"🎯 <b>الهدف المطلوب (روابط):</b> <code>{target_str}</code>\n"
+        f"⚙️ <b>الخطوط النشطة الآن:</b> <code>{s.tasks_reserved} / {s.max_workers}</code>\n"
+        f"🛒 <b>إجمالي الأرقام المشتراة:</b> <code>{s.bought}</code>\n"
         f"📩 <b>أكواد OTP المستلمة:</b> <code>{s.otp_received}</code>\n"
         f"✅ <b>الروابط المستخرجة:</b> <code>{s.success_links}</code>\n\n"
         f"⚠️ <b>تفاصيل الفشل:</b>\n"
@@ -368,12 +408,12 @@ async def update_dashboard(user_id, context: ContextTypes.DEFAULT_TYPE):
     s = active_sessions[user_id]
     while s.status in ["running", "stopping"]:
         # التوقف التلقائي للإشعار
-        if s.status == "running" and s.target_limit > 0 and s.bought >= s.target_limit and s.recurring_mode == 0:
+        if s.status == "running" and s.target_limit > 0 and s.success_links >= s.target_limit and s.recurring_mode == 0:
             s.status = "stopping"
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id), 
-                    text=add_custom_emojis(f"🎯 <b>اكتمل شراء {s.target_limit} أرقام!</b>\nجاري انتظار الأكواد للأرقام المتبقية أو تصفيتها، وسيتوقف النظام تلقائياً."), 
+                    text=add_custom_emojis(f"🎯 <b>اكتمل استخراج {s.target_limit} روابط بنجاح!</b>\nتم إيقاف النظام تلقائياً."), 
                     parse_mode='HTML'
                 )
             except: pass
@@ -411,11 +451,14 @@ async def start_extraction(uid, api_key, context, target_buys, workers_count, me
     session.status = "running"
     session.limit_lock = asyncio.Lock()  
     
-    mode_text = f"عدد محدد ({target_buys} أرقام)" if target_buys > 0 else "شراء مفتوح (حسب الرصيد)"
+    msg = await message_obj.reply_text("🧹 <b>جاري إلغاء الأرقام الجاهزة للإلغاء فوراً...</b>", parse_mode='HTML')
+    cancelled = await cancel_active_grizzly_numbers(api_key)
+    
+    mode_text = f"عدد محدد ({target_buys} روابط)" if target_buys > 0 else "شراء مفتوح (حسب الرصيد)"
     if recurring > 0:
-        mode_text = f"جدولة متكررة ({recurring} أرقام كل دقيقتين)"
+        mode_text = f"جدولة متكررة ({recurring} كل دقيقتين)"
         
-    await message_obj.edit_text(f"🚀 <b>جاري بدء التشغيل...</b>\nالوضع: <code>{mode_text}</code>", parse_mode='HTML')
+    await msg.edit_text(f"✅ <b>تم تنظيف {cancelled} أرقام معلقة.</b>\n🚀 <b>جاري بدء التشغيل...</b>\nالوضع: <code>{mode_text}</code>", parse_mode='HTML')
     
     session.message_obj = await message_obj.reply_text(
         text=get_dashboard_text(uid),
@@ -447,10 +490,10 @@ def user_main_menu(user_id):
 
 def run_options_menu():
     keyboard = [
-        [InlineKeyboardButton("1️⃣ شراء رقم 1 فقط", callback_data='run_mode_1')],
-        [InlineKeyboardButton("🔢 شراء عدد مخصص من الأرقام", callback_data='run_mode_custom')],
+        [InlineKeyboardButton("1️⃣ استخراج رابط 1 فقط", callback_data='run_mode_1')],
+        [InlineKeyboardButton("🔢 استخراج عدد مخصص من الروابط", callback_data='run_mode_custom')],
         [InlineKeyboardButton("🔄 وضع الجدولة (متكرر كل دقيقتين)", callback_data='run_mode_recurring')],
-        [InlineKeyboardButton("♾️ شراء مستمر بلا حدود", callback_data='run_mode_unlimited')],
+        [InlineKeyboardButton("♾️ سحب مستمر بلا حدود", callback_data='run_mode_unlimited')],
         [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data='main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -497,14 +540,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in users_db or not users_db[uid].get("approved"):
         return
 
-    # إدخال العدد المخصص العادي
+    # إدخال العدد المخصص للروابط
     if users_db[uid].get("state") == "waiting_limit":
         if text.isdigit() and int(text) > 0:
             limit = int(text)
             users_db[uid]["state"] = "idle"
             save_db(users_db)
             workers = min(limit, 20) 
-            await update.message.reply_text(f"✅ تم استلام الهدف: سيتم شراء {limit} أرقام وتتوقف العملية.")
+            await update.message.reply_text(f"✅ تم استلام الهدف: سيتم استخراج {limit} روابط وتتوقف العملية.")
             await start_extraction(uid, users_db[uid]["api_key"], context, limit, workers, update.message)
         else:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 5).")
@@ -516,8 +559,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit = int(text)
             users_db[uid]["state"] = "idle"
             save_db(users_db)
-            workers = min(limit * 2, 20) # عمال أكثر شوية لأن العملية مستمرة
-            await update.message.reply_text(f"✅ تم تفعيل الجدولة: سيتم شراء {limit} أرقام وتكرارها كل دقيقتين.")
+            workers = min(limit * 2, 20)
+            await update.message.reply_text(f"✅ تم تفعيل الجدولة: سيتم استخراج {limit} روابط وتكرارها كل دقيقتين.")
             await start_extraction(uid, users_db[uid]["api_key"], context, limit, workers, update.message, recurring=limit)
         else:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 2).")
@@ -608,18 +651,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("⚙️ <b>إعدادات بدء السحب:</b>\n\nاختر وضع التشغيل المناسب لك:", reply_markup=run_options_menu(), parse_mode='HTML')
 
     elif data == 'run_mode_1':
-        await query.answer("🚀 بدء شراء رقم 1 فقط...", show_alert=False)
+        await query.answer("🚀 بدء سحب رابط 1 فقط...", show_alert=False)
         await start_extraction(uid, api_key, context, target_buys=1, workers_count=1, message_obj=query.message)
 
     elif data == 'run_mode_custom':
         users_db[uid]["state"] = "waiting_limit"
         save_db(users_db)
-        await query.message.edit_text("🔢 <b>أرسل الآن بالدردشة عدد الأرقام التي تريد شراءها:</b>\n\n<i>(مثال: 5 وسيتم شراء 5 أرقام فقط ثم يتوقف)</i>", parse_mode='HTML')
+        await query.message.edit_text("🔢 <b>أرسل الآن بالدردشة عدد الروابط الناجحة التي تريدها:</b>\n\n<i>(مثال: 5 وسيتم شراء وتعويض الأرقام حتى تحصل على 5 روابط)</i>", parse_mode='HTML')
 
     elif data == 'run_mode_recurring':
         users_db[uid]["state"] = "waiting_recurring"
         save_db(users_db)
-        await query.message.edit_text("🔄 <b>أرسل الآن حجم الدفعة للوضع المتكرر:</b>\n\n<i>(مثال: 2 يعني سيشتري رقمين، وينتظر دقيقتين، ثم يشتري رقمين أخرى وهكذا)</i>", parse_mode='HTML')
+        await query.message.edit_text("🔄 <b>أرسل الآن حجم الدفعة للوضع المتكرر:</b>\n\n<i>(مثال: 2 يعني سيطلب رابطين، وينتظر دقيقتين، ثم يطلب رابطين أخرى وهكذا)</i>", parse_mode='HTML')
 
     elif data == 'run_mode_unlimited':
         await query.answer("⚠️ تنبيه: هذا الوضع يعمل تلقائياً وسيتم السحب من الرصيد بشكل مستمر حتى تقوم بإيقافه يدوياً!", show_alert=True)
