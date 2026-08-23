@@ -13,6 +13,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 ADMIN_ID = 643309456 # الأيدي الخاص بك
 
+# الأيديات المسموح لها بالدخول مباشرة (VIP)
+ALLOWED_IDS = ["1715862764", "643309456", str(ADMIN_ID)]
+
 # روابط Jio
 CHECK_NUMBER_URL = "https://www.jio.com/api/jio-recharge-service/recharge/mobility/number/{mobile}"
 SEND_OTP_URL = "https://www.jio.com/api/jio-login-service/login/sendOtp"
@@ -61,15 +64,30 @@ class UserSession:
         self.alert_sent = False 
         self.target_limit = 0  # 0 يعني لا محدود
         self.max_workers = 20
+        # إضافات التحكم بالمهام
+        self.limit_lock = None  
+        self.tasks_reserved = 0 
 
 active_sessions = {}
 
-# ============ دوال التأخير والتصفح ============
+# ============ دوال التأخير والتصفح والإيموجيات ============
 def human_delay(min_sec=1.5, max_sec=3.5):
     time.sleep(random.uniform(min_sec, max_sec))
 
 async def async_human_delay(min_sec=2.0, max_sec=4.5):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
+
+def add_custom_emojis(text: str) -> str:
+    """استبدال أسماء الدول بإيموجيات مخصصة (Custom Emojis) بصيغة HTML"""
+    replacements = {
+        r"(الكويت|دينار كويتي)": r"\1 <tg-emoji emoji-id='5221949726718442491'>🇰🇼</tg-emoji>",
+        r"(السعودية|ريال سعودي)": r"\1 <tg-emoji emoji-id='5224698145010624573'>🇸🇦</tg-emoji>",
+        r"(الامارات|درهم اماراتي|درهم إماراتي|الاماراتب)": r"\1 <tg-emoji emoji-id='5224565851427976312'>🇦🇪</tg-emoji>",
+        r"(السودان|جنيه سوداني)": r"\1 <tg-emoji emoji-id='5224372990216514135'>🇸🇩</tg-emoji>"
+    }
+    for pattern, emoji_tag in replacements.items():
+        text = re.sub(pattern, emoji_tag, text)
+    return text
 
 def create_jio_session() -> requests.Session:
     session = requests.Session()
@@ -147,8 +165,9 @@ async def cancel_active_grizzly_numbers(api_key):
             for item in data.get("activeActivations", []):
                 tzid = item.get("activationId")
                 if tzid:
-                    await cancel_grizzly_number(api_key, tzid)
-                    count += 1
+                    success = await cancel_grizzly_number(api_key, tzid)
+                    if success:
+                        count += 1
     except: pass
     return count
 
@@ -173,28 +192,51 @@ async def check_grizzly_otp(api_key, tzid):
     except: pass
     return None
 
-async def cancel_grizzly_number(api_key, tzid):
+async def cancel_grizzly_number(api_key, tzid) -> bool:
+    """دالة الإلغاء الدقيقة - تتأكد من رد السيرفر الفعلي"""
     url = f"{GRIZZLY_API_URL}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
-    try: await asyncio.to_thread(requests.get, url, timeout=10)
+    try: 
+        resp = await asyncio.to_thread(requests.get, url, timeout=10)
+        text = resp.text.strip()
+        if "ACCESS_CANCEL" in text:
+            return True
+        # إذا رفض السيرفر الإلغاء المبكر (EARLY_CANCEL_DENIED)، يعتبر الرقم غير ملغى حالياً
     except: pass
+    return False
 
 # ============ المنظومة الذاتية للمستخدم ============
+
+async def reserve_task(session: UserSession) -> bool:
+    """دالة حجز المهام لضمان عدم تجاوز العدد المطلوب"""
+    async with session.limit_lock:
+        if session.status != "running":
+            return False
+        if session.target_limit > 0 and session.tasks_reserved >= session.target_limit:
+            return False
+        session.tasks_reserved += 1
+        return True
+
 async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     session_data = active_sessions[user_id]
     api_key = session_data.api_key
     
     while session_data.status == "running":
-        # إيقاف تلقائي إذا اكتمل الهدف (في حال لم يكن الوضع لا محدود)
-        if session_data.target_limit > 0 and session_data.success_links >= session_data.target_limit:
-            session_data.status = "stopping"
-            break
-
+        
+        # التأكد من عدم تجاوز عدد الـ workers المسموح
         if session_data.active_workers >= session_data.max_workers:
             await asyncio.sleep(2)
             continue
 
+        # محاولة حجز مساحة للعملية (لضبط العدد المخصص)
+        allowed = await reserve_task(session_data)
+        if not allowed:
+            break # إذا وصلنا للهدف، العامل يتوقف
+
         tzid, number = await get_grizzly_number(api_key)
         if not tzid:
+            # إذا فشل شراء الرقم، نلغي الحجز حتى نعوضه برقم ثاني
+            async with session_data.limit_lock:
+                session_data.tasks_reserved -= 1
             await asyncio.sleep(3)
             continue
 
@@ -202,6 +244,7 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
         session_data.alert_sent = False 
         session_data.bought += 1
         session_data.active_workers += 1
+        success_in_this_run = False
         
         try:
             mobile = number[2:] if number.startswith("91") else number
@@ -245,12 +288,17 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
                 await async_human_delay(2.0, 5.0)
                 status, url = await asyncio.to_thread(extract_activation, session)
                 if status == "success":
+                    success_in_this_run = True
                     with open(f"gemini_links_{user_id}.txt", "a") as f: f.write(url + "\n")
                     session_data.success_links += 1
+                    
+                    text_msg = f"🎉 <b>تم صيد رابط جديد!</b>\n\n📱 الرقم: <code>{mobile}</code>\n🔗 الرابط:\n{url}"
+                    # تطبيق الإيموجيات على النص
+                    text_msg = add_custom_emojis(text_msg)
                     try:
                         await context.bot.send_message(
                             chat_id=int(user_id), 
-                            text=f"🎉 <b>تم صيد رابط جديد!</b>\n\n📱 الرقم: <code>{mobile}</code>\n🔗 الرابط:\n{url}", 
+                            text=text_msg, 
                             parse_mode='HTML'
                         )
                     except Exception as e:
@@ -259,6 +307,10 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
             else: session_data.otp_rejected_jio += 1
         finally:
             session_data.active_workers -= 1
+            # إذا لم تنجح العملية، نلغي حجز المهمة ليتم تعويضها برقم آخر
+            if not success_in_this_run:
+                async with session_data.limit_lock:
+                    session_data.tasks_reserved -= 1
 
 def get_dashboard_text(user_id):
     s = active_sessions[user_id]
@@ -267,28 +319,34 @@ def get_dashboard_text(user_id):
     
     target_str = f"{s.target_limit}" if s.target_limit > 0 else "غير محدود ♾️"
     
-    return (
-        f"📊 **إحصائيات الحساب المباشرة:**\n\n"
+    # تحويل الواجهة لـ HTML لدعم Custom Emojis
+    raw_text = (
+        f"📊 <b>إحصائيات الحساب المباشرة:</b>\n\n"
         f"الحالة: {status_emoji} {status_text}\n"
-        f"🎯 **الهدف المطلوب:** `{target_str}`\n"
-        f"⚙️ **الخطوط النشطة الآن:** `{s.active_workers} / {s.max_workers}`\n"
-        f"🛒 **إجمالي المشتراة:** `{s.bought}`\n"
-        f"📩 **أكواد OTP المستلمة:** `{s.otp_received}`\n"
-        f"✅ **الروابط المستخرجة:** `{s.success_links}`\n\n"
-        f"⚠️ **تفاصيل الفشل:**\n"
-        f"⏳ ملغاة لعدم وصول الكود: `{s.cancelled_timeout}`\n"
-        f"❌ ليس Jio (مرفوض من البداية): `{s.invalid_jio}`\n"
-        f"🔄 *يتم التحديث تلقائياً...*"
+        f"🎯 <b>الهدف المطلوب:</b> <code>{target_str}</code>\n"
+        f"⚙️ <b>الخطوط النشطة الآن:</b> <code>{s.active_workers} / {s.max_workers}</code>\n"
+        f"🛒 <b>إجمالي المشتراة:</b> <code>{s.bought}</code>\n"
+        f"📩 <b>أكواد OTP المستلمة:</b> <code>{s.otp_received}</code>\n"
+        f"✅ <b>الروابط المستخرجة:</b> <code>{s.success_links}</code>\n\n"
+        f"⚠️ <b>تفاصيل الفشل:</b>\n"
+        f"⏳ ملغاة لعدم وصول الكود: <code>{s.cancelled_timeout}</code>\n"
+        f"❌ ليس Jio (مرفوض من البداية): <code>{s.invalid_jio}</code>\n"
+        f"🔄 <i>يتم التحديث تلقائياً...</i>"
     )
+    return add_custom_emojis(raw_text)
 
 async def update_dashboard(user_id, context: ContextTypes.DEFAULT_TYPE):
     s = active_sessions[user_id]
     while s.status in ["running", "stopping"]:
-        # التوقف التلقائي عند اكتمال الهدف
+        # التوقف التلقائي عند اكتمال الهدف الحقيقي (الروابط المستخرجة)
         if s.status == "running" and s.target_limit > 0 and s.success_links >= s.target_limit:
             s.status = "stopping"
             try:
-                await context.bot.send_message(chat_id=int(user_id), text=f"🎯 **اكتمل الهدف بنجاح!**\nتم استخراج {s.target_limit} روابط، وتم إيقاف النظام تلقائياً لإيقاف صرف الرصيد.", parse_mode='Markdown')
+                await context.bot.send_message(
+                    chat_id=int(user_id), 
+                    text=add_custom_emojis(f"🎯 <b>اكتمل الهدف بنجاح!</b>\nتم استخراج {s.target_limit} روابط، وتم إيقاف النظام تلقائياً لإيقاف صرف الرصيد."), 
+                    parse_mode='HTML'
+                )
             except: pass
 
         # التنبيه في حال مرور ساعة بلا رصيد
@@ -296,18 +354,18 @@ async def update_dashboard(user_id, context: ContextTypes.DEFAULT_TYPE):
             s.status = "stopping" 
             s.alert_sent = True
             try:
-                await context.bot.send_message(chat_id=int(user_id), text="⚠️ **تنبيه هام:**\nمرت ساعة كاملة ولم أتمكن من سحب أي رقم!\nتم إيقاف السحب مؤقتاً لتجنب المشاكل.", parse_mode='Markdown')
+                await context.bot.send_message(chat_id=int(user_id), text="⚠️ <b>تنبيه هام:</b>\nمرت ساعة كاملة ولم أتمكن من سحب أي رقم!\nتم إيقاف السحب مؤقتاً لتجنب المشاكل.", parse_mode='HTML')
             except: pass
 
         if s.message_obj:
             markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف النظام", callback_data='stop_bot')]]) if s.status == "running" else None
-            try: await s.message_obj.edit_text(text=get_dashboard_text(user_id), reply_markup=markup, parse_mode='Markdown')
+            try: await s.message_obj.edit_text(text=get_dashboard_text(user_id), reply_markup=markup, parse_mode='HTML')
             except: pass
                 
         if s.status == "stopping" and s.active_workers <= 0:
             s.status = "stopped"
             s.active_workers = 0 
-            try: await s.message_obj.edit_text(text=get_dashboard_text(user_id).replace("🔄 *يتم التحديث تلقائياً...*", "🛑 **[تم الإيقاف]** الساحة نظيفة."), parse_mode='Markdown')
+            try: await s.message_obj.edit_text(text=get_dashboard_text(user_id).replace("🔄 <i>يتم التحديث تلقائياً...</i>", "🛑 <b>[تم الإيقاف]</b> الساحة نظيفة."), parse_mode='HTML')
             except: pass
             break
         await asyncio.sleep(4)
@@ -317,21 +375,23 @@ async def start_extraction(uid, api_key, context, target_limit, workers_count, m
         active_sessions[uid] = UserSession(uid, api_key)
     session = active_sessions[uid]
     
-    msg = await message_obj.reply_text("🧹 **جاري الاتصال بالموقع وإلغاء أي أرقام معلقة بحسابك قبل البدء...**", parse_mode='Markdown')
+    msg = await message_obj.reply_text("🧹 <b>جاري الاتصال بالموقع وإلغاء أي أرقام معلقة بحسابك قبل البدء...</b>", parse_mode='HTML')
     cancelled = await cancel_active_grizzly_numbers(api_key)
     
     mode_text = f"عدد محدد ({target_limit})" if target_limit > 0 else "شراء مفتوح (حسب الرصيد)"
-    await msg.edit_text(f"✅ **تم تنظيف {cancelled} أرقام معلقة.**\n🚀 **جاري بدء التشغيل...**\nالوضع: `{mode_text}`", parse_mode='Markdown')
+    await msg.edit_text(f"✅ <b>تم تنظيف {cancelled} أرقام معلقة.</b>\n🚀 <b>جاري بدء التشغيل...</b>\nالوضع: <code>{mode_text}</code>", parse_mode='HTML')
     
     session.__init__(uid, api_key) 
     session.target_limit = target_limit
     session.max_workers = workers_count
     session.status = "running"
+    session.limit_lock = asyncio.Lock()  # تهيئة القفل
+    session.tasks_reserved = 0
     
     session.message_obj = await message_obj.reply_text(
         text=get_dashboard_text(uid),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف النظام", callback_data='stop_bot')]]),
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
     for i in range(workers_count):
@@ -375,9 +435,12 @@ async def start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(user.id)
     
     if uid not in users_db:
-        users_db[uid] = {"username": user.username, "approved": False, "api_key": None, "banned": False, "state": "idle"}
+        # نظام الصلاحيات الفورية للـ VIP
+        is_approved = uid in ALLOWED_IDS
+        users_db[uid] = {"username": user.username, "approved": is_approved, "api_key": None, "banned": False, "state": "idle"}
         save_db(users_db)
-        await context.bot.send_message(ADMIN_ID, f"🔔 مستخدم جديد يطلب الصلاحية:\nيوزر: @{user.username}\nأيدي: `{uid}`\nللموافقة: `/approve {uid}`", parse_mode='Markdown')
+        if not is_approved:
+            await context.bot.send_message(ADMIN_ID, f"🔔 مستخدم جديد يطلب الصلاحية:\nيوزر: @{user.username}\nأيدي: <code>{uid}</code>\nللموافقة: /approve {uid}", parse_mode='HTML')
     
     if users_db[uid].get("banned"):
         await update.message.reply_text("❌ حسابك محظور من استخدام البوت.")
@@ -443,7 +506,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============== أزرار الإدارة ==============
     if data == 'admin_panel':
         if int(uid) != ADMIN_ID: return
-        await query.message.edit_text("👨‍💻 **لوحة تحكم الإدارة:**\nاختر الإجراء المطلوب:", reply_markup=admin_main_menu(), parse_mode='Markdown')
+        await query.message.edit_text("👨‍💻 <b>لوحة تحكم الإدارة:</b>\nاختر الإجراء المطلوب:", reply_markup=admin_main_menu(), parse_mode='HTML')
         return
 
     if data == 'admin_users_stats':
@@ -455,7 +518,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard.append([InlineKeyboardButton(f"👤 عرض إحصائيات: {username}", callback_data=f'view_u_{u_id}')])
         keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data='admin_panel')])
         
-        await query.message.edit_text("👥 **اختر المستخدم لعرض إحصائياته الحالية:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.message.edit_text("👥 <b>اختر المستخدم لعرض إحصائياته الحالية:</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return
 
     if data.startswith('view_u_'):
@@ -468,7 +531,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"⚠️ المستخدم متوقف عن العمل حالياً أو لم يقم بتشغيل السحب."
             
         keyboard = [[InlineKeyboardButton("🔙 رجوع لقائمة المستخدمين", callback_data='admin_users_stats')]]
-        await query.message.edit_text(f"👤 **إحصائيات المستخدم `{target_uid}`:**\n\n{text}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.message.edit_text(f"👤 <b>إحصائيات المستخدم <code>{target_uid}</code>:</b>\n\n{text}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return
 
     if data == 'admin_get_links':
@@ -481,7 +544,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_uid = file.split('_')[2].split('.')[0]
                 username = users_db.get(target_uid, {}).get("username", "مجهول")
                 with open(file, 'rb') as doc:
-                    await context.bot.send_document(chat_id=ADMIN_ID, document=doc, caption=f"🔗 روابط المستخدم: @{username}\nأيدي: `{target_uid}`", parse_mode='Markdown')
+                    await context.bot.send_document(chat_id=ADMIN_ID, document=doc, caption=f"🔗 روابط المستخدم: @{username}\nأيدي: <code>{target_uid}</code>", parse_mode='HTML')
         
         if not files_found:
             await query.message.reply_text("⚠️ لا توجد أي ملفات روابط مسجلة حتى الآن.")
@@ -499,7 +562,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if session and session.status in ["running", "stopping"]:
             await query.answer("⚠️ نظامك يعمل بالفعل أو قيد الإيقاف!", show_alert=True)
             return
-        await query.message.edit_text("⚙️ **إعدادات بدء السحب:**\n\nاختر وضع التشغيل المناسب لك:", reply_markup=run_options_menu(), parse_mode='Markdown')
+        await query.message.edit_text("⚙️ <b>إعدادات بدء السحب:</b>\n\nاختر وضع التشغيل المناسب لك:", reply_markup=run_options_menu(), parse_mode='HTML')
 
     elif data == 'run_mode_1':
         await query.answer("🚀 بدء سحب رابط واحد...", show_alert=False)
@@ -509,7 +572,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'run_mode_custom':
         users_db[uid]["state"] = "waiting_limit"
         save_db(users_db)
-        await query.message.edit_text("🔢 **أرسل الآن بالدردشة عدد الروابط التي تريد استخراجها:**\n\n*(اكتب رقماً فقط، مثال: 5 وسيتم توقيف البوت تلقائياً عند صيد 5 روابط)*", parse_mode='Markdown')
+        await query.message.edit_text("🔢 <b>أرسل الآن بالدردشة عدد الروابط التي تريد استخراجها:</b>\n\n<i>(اكتب رقماً فقط، مثال: 5 وسيتم توقيف البوت تلقائياً عند صيد 5 روابط)</i>", parse_mode='HTML')
 
     elif data == 'run_mode_unlimited':
         await query.answer("⚠️ تنبيه: هذا الوضع يعمل تلقائياً وسيتم السحب من الرصيد بشكل مستمر حتى تقوم بإيقافه يدوياً!", show_alert=True)
@@ -527,7 +590,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🗑 جاري مسح جميع الأرقام المعلقة...", show_alert=False)
         msg = await query.message.reply_text("⏳ جاري الاتصال بالموقع لإلغاء الأرقام المعلقة...")
         cancelled = await cancel_active_grizzly_numbers(api_key)
-        await msg.edit_text(f"✅ **تم بنجاح إلغاء {cancelled} رقم معلق، وتم استرداد رصيدها!**", parse_mode='Markdown')
+        await msg.edit_text(f"✅ <b>تم بنجاح إلغاء {cancelled} رقم معلق، وتم استرداد رصيدها!</b>", parse_mode='HTML')
 
     elif data == 'change_api':
         users_db[uid]["api_key"] = None
@@ -541,7 +604,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if session and session.status in ["running", "stopping"]:
             await query.answer("انظر إلى الرسالة المحدثة في الأسفل 👇", show_alert=True)
         elif session:
-            await query.message.reply_text(get_dashboard_text(uid), parse_mode='Markdown')
+            await query.message.reply_text(get_dashboard_text(uid), parse_mode='HTML')
         else:
             await query.answer("لا توجد إحصائيات لعرضها حالياً. اضغط بدء السحب أولاً.", show_alert=True)
 
