@@ -70,6 +70,7 @@ class UserSession:
         self.recurring_mode = 0 
         self.limit_lock = None  
         self.tasks_reserved = 0 
+        self.last_api_error = "" 
 
 active_sessions = {}
 
@@ -78,15 +79,37 @@ def get_provider_url(provider_name):
     return UOTP_API_URL if provider_name == "uotp" else GRIZZLY_API_URL
 
 async def get_sms_number(api_key, provider):
-    url = f"{get_provider_url(provider)}?api_key={api_key}&action=getNumber&service=jio&country=22"
-    try:
-        resp = await asyncio.to_thread(requests.get, url, timeout=15)
-        text = resp.text.strip()
-        if text.startswith("ACCESS_NUMBER"):
-            parts = text.split(":")
-            return parts[1], parts[2]
-    except: pass
-    return None, None
+    """شراء الرقم (هندي حصراً country=22) مع التدرج الذكي بالسعر لموقع UOTP"""
+    urls = []
+    
+    if provider == "uotp":
+        # يبدأ من الأرخص (13) ويصعد للـ 16 إذا ماكو أرقام
+        for price in [13, 14, 15, 16]:
+            urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service=myjio&country=22&maxPrice={price}")
+            urls.append(f"{UOTP_API_URL}?api_key={api_key}&action=getNumber&service=jio&country=22&maxPrice={price}")
+    else:
+        urls = [f"{GRIZZLY_API_URL}?api_key={api_key}&action=getNumber&service=jio&country=22"]
+        
+    last_err = ""
+    for url in urls:
+        try:
+            resp = await asyncio.to_thread(requests.get, url, timeout=15)
+            text = resp.text.strip()
+            if text.startswith("ACCESS_NUMBER"):
+                parts = text.split(":")
+                return parts[1], parts[2], ""
+            else:
+                last_err = text
+                # إذا ماكو أرقام بهذا السعر، كمل للرابط اللي بعده (السعر الأغلى)
+                if text in ["NO_NUMBERS", "BAD_SERVICE", "BAD_OPERATOR"]:
+                    continue
+                else:
+                    break # أخطاء مثل NO_BALANCE توقف المحاولات فوراً
+        except Exception as e:
+            last_err = "خطأ اتصال بالموقع"
+            break
+            
+    return None, None, last_err
 
 async def check_sms_otp(api_key, tzid, provider):
     url = f"{get_provider_url(provider)}?api_key={api_key}&action=getStatus&id={tzid}"
@@ -99,18 +122,7 @@ async def check_sms_otp(api_key, tzid, provider):
     return None
 
 async def robust_cancel(api_key, tzid, provider, context=None, user_id=None, check_for_otp=False):
-    """إلغاء يتكيف مع المزود: فوري لـ UOTP، وانتظار ذكي لـ Grizzly"""
-    
-    # إذا كان UOTP، نلغي فوراً بدون Loop
-    if provider == "uotp":
-        url = f"{UOTP_API_URL}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
-        try:
-            resp = await asyncio.to_thread(requests.get, url, timeout=10)
-            if "ACCESS_CANCEL" in resp.text: return True
-        except: pass
-        return False
-
-    # إذا كان Grizzly، ندخل في نظام المراقبة والدقيقتين
+    """إلغاء الأرقام بعد انتظار الدقيقتين لكلا المزودين، مع اقتناص الأكواد المتأخرة"""
     for _ in range(30):
         if check_for_otp and context and user_id:
             otp = await check_sms_otp(api_key, tzid, provider)
@@ -121,7 +133,7 @@ async def robust_cancel(api_key, tzid, provider, context=None, user_id=None, che
                 except: pass
                 return True
         
-        url = f"{GRIZZLY_API_URL}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
+        url = f"{get_provider_url(provider)}?api_key={api_key}&action=setStatus&status=8&id={tzid}"
         try:
             resp = await asyncio.to_thread(requests.get, url, timeout=10)
             if "ACCESS_CANCEL" in resp.text:
@@ -136,7 +148,7 @@ async def cancel_active_numbers_startup(api_key, provider):
     try:
         resp = await asyncio.to_thread(requests.get, url, timeout=15)
         text_resp = resp.text.strip()
-        if text_resp == "NO_ACTIVATIONS": return 0
+        if text_resp == "NO_ACTIVATIONS" or "BAD_ACTION" in text_resp: return 0
         
         data = resp.json()
         if data.get("status") == "success":
@@ -163,7 +175,6 @@ async def smart_cancel_all_task(api_key, provider, context, user_id, msg_obj):
         try:
             data = resp.json()
         except ValueError:
-            # إذا رد الموقع بخطأ غريب أو مابيه دوال نشطة
             if "BAD_ACTION" in text_resp:
                 await msg_obj.edit_text("⚠️ المزود لا يدعم جلب الأرقام المعلقة جماعياً.", parse_mode='HTML')
             else:
@@ -176,7 +187,7 @@ async def smart_cancel_all_task(api_key, provider, context, user_id, msg_obj):
                 await msg_obj.edit_text("✅ <b>لا توجد أرقام معلقة حالياً بحسابك.</b>", parse_mode='HTML')
                 return
             
-            cancel_msg = "⏳ جاري الإلغاء فوراً..." if provider == "uotp" else "⏳ جاري مراقبتها وإلغائها بمجرد انتهاء فترة الدقيقتين..."
+            cancel_msg = "⏳ جاري مراقبتها وإلغائها بمجرد انتهاء فترة الدقيقتين..."
             await msg_obj.edit_text(f"🗑 <b>تم العثور على {len(activations)} أرقام جارية.</b>\n{cancel_msg}", parse_mode='HTML')
             
             for item in activations:
@@ -320,11 +331,17 @@ async def worker_task(context: ContextTypes.DEFAULT_TYPE, user_id: str):
             continue
 
         try:
-            tzid, number = await get_sms_number(api_key, provider)
+            tzid, number, err_msg = await get_sms_number(api_key, provider)
+            
             if not tzid:
+                session_data.last_api_error = err_msg 
+                if err_msg in ["NO_BALANCE", "BAD_KEY", "ACCOUNT_BAN"]:
+                    session_data.status = "stopping"
+                    
                 await asyncio.sleep(3)
                 continue 
 
+            session_data.last_api_error = "" 
             session_data.bought += 1
             session_data.last_buy_time = time.time()
             session_data.alert_sent = False 
@@ -399,6 +416,8 @@ def get_dashboard_text(user_id):
     target_str = f"{s.target_limit}" if s.target_limit > 0 else "غير محدود ♾️"
     if s.recurring_mode > 0:
         target_str += f" (يطلب {s.recurring_mode} كل دقيقتين 🔄)"
+        
+    api_error_text = f"🚫 <b>خطأ المزود:</b> <code>{s.last_api_error}</code>\n" if s.last_api_error else ""
     
     raw_text = (
         f"📊 <b>إحصائيات الحساب المباشرة ({provider_name}):</b>\n\n"
@@ -408,6 +427,7 @@ def get_dashboard_text(user_id):
         f"🛒 <b>إجمالي المحاولات (أرقام):</b> <code>{s.bought}</code>\n"
         f"📩 <b>أكواد OTP المستلمة:</b> <code>{s.otp_received}</code>\n"
         f"✅ <b>الروابط المستخرجة بنجاح:</b> <code>{s.success_links}</code>\n\n"
+        f"{api_error_text}"
         f"⚠️ <b>تفاصيل الأرقام المعوضة:</b>\n"
         f"⏳ ملغاة لعدم وصول الكود: <code>{s.cancelled_timeout}</code>\n"
         f"❌ مرفوض في Jio: <code>{s.invalid_jio}</code>\n"
@@ -559,7 +579,6 @@ async def start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_approved:
             await context.bot.send_message(ADMIN_ID, f"🔔 طلب صلاحية:\nيوزر: @{user.username}\nأيدي: <code>{uid}</code>\nللموافقة: /approve {uid}", parse_mode='HTML')
     
-    # تحديث قاعدة البيانات للمستخدمين القدامى
     if "api_key" in users_db[uid]:
         old_key = users_db[uid].pop("api_key")
         users_db[uid]["grizzly_api_key"] = old_key
@@ -594,7 +613,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users_db[uid]["state"] = "idle"
             save_db(users_db)
             workers = min(limit, 20) 
-            await update.message.reply_text(f"✅ تم استلام الهدف: {limit} روابط.")
+            await update.message.reply_text(f"✅ تم استلام الهدف: {limit} روابط مقبولة.")
             await start_extraction(uid, context, limit, workers, update.message)
         else:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من الصفر.")
